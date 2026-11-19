@@ -1,6 +1,6 @@
 # Nexus AI — Enterprise Knowledge Assistant
 
-Nexus AI is an enterprise-grade AI knowledge assistant built with Python, FastAPI, PostgreSQL, SQLAlchemy 2.0, Alembic, React, and TypeScript.
+Nexus AI is an enterprise-grade AI knowledge assistant built with Python, FastAPI, PostgreSQL, SQLAlchemy 2.0, Alembic, PyMuPDF, React, and TypeScript.
 
 ---
 
@@ -13,7 +13,8 @@ Nexus-AI/
 ├── backend/
 │   ├── alembic/                 # Database migrations with Alembic
 │   │   ├── versions/            # Migration revisions
-│   │   │   └── 79e44e4ca26b_create_users_table.py
+│   │   │   ├── 79e44e4ca26b_create_users_table.py
+│   │   │   └── e06af26617f5_create_documents_and_chunks_tables.py
 │   │   └── env.py               # Alembic runner with application config
 │   ├── app/
 │   │   ├── api/
@@ -21,6 +22,7 @@ Nexus-AI/
 │   │   │   └── routes/          # API route definitions and sub-routers
 │   │   │       ├── __init__.py  # Aggregated v1 router
 │   │   │       ├── auth.py      # Registration, login, /me routes
+│   │   │       ├── documents.py # Document upload, listing, chunks & deletion (M3.1)
 │   │   │       └── health.py    # Health & telemetry endpoint (/api/v1/health)
 │   │   ├── core/                # Configuration, logging, centralized exceptions, security
 │   │   │   ├── config.py        # Pydantic Settings & environment variables
@@ -31,18 +33,26 @@ Nexus-AI/
 │   │   │   └── session.py       # Engine with QueuePool, Base, and get_db dependency
 │   │   ├── models/              # SQLAlchemy 2.0 ORM domain entities
 │   │   │   ├── __init__.py
-│   │   │   └── user.py          # User ORM model
+│   │   │   ├── user.py          # User ORM model
+│   │   │   └── document.py      # Document and DocumentChunk ORM models
 │   │   ├── schemas/             # Pydantic v2 schemas for request/response validation
 │   │   │   ├── health.py        # HealthCheckResponse schema
-│   │   │   └── user.py          # UserRegisterRequest, UserLoginRequest, UserResponse, TokenResponse
+│   │   │   ├── user.py          # User request and response schemas
+│   │   │   └── document.py      # Document & DocumentChunk request and response schemas
 │   │   ├── services/            # Business & orchestration logic
 │   │   │   ├── auth_service.py  # User registration, authentication & queries
-│   │   │   └── health_service.py# Health service & database probe implementation
+│   │   │   ├── chunking_service.py # Sentence/paragraph boundary chunker with overlap
+│   │   │   ├── document_service.py # Ingestion pipeline, streaming, storage, persistence
+│   │   │   ├── health_service.py# Health service & database probe implementation
+│   │   │   └── pdf_processor.py # PyMuPDF (fitz) text extraction & normalization
 │   │   └── main.py              # FastAPI application factory and CORS middleware
 │   ├── tests/                   # Pytest unit and integration test suite
 │   │   ├── conftest.py          # Isolated in-memory DB fixtures and FastAPI TestClient
-│   │   ├── test_auth.py         # M2.1 Auth tests (registration, duplicate, invalid, login, JWT)
+│   │   ├── test_auth.py         # M2.1 Auth tests (registration, duplicate, login, JWT)
+│   │   ├── test_documents.py    # M3.1 Ingestion, PyMuPDF extraction, chunking, security
 │   │   └── test_health.py       # Health check, DB probe, and CORS tests
+│   ├── storage/
+│   │   └── documents/           # Configurable directory for uploaded PDF files
 │   ├── .env                     # Local environment configuration
 │   ├── .env.example             # Template environment variables
 │   ├── alembic.ini              # Alembic migration configuration
@@ -76,32 +86,39 @@ Nexus-AI/
 
 ---
 
-## Database Setup & Configuration
+## Configuration Settings
 
-### PostgreSQL Configuration
-
-Configure PostgreSQL connection settings in `.env`:
+Configure environment settings in `.env`:
 
 ```env
+# Database
 POSTGRES_SERVER=localhost
 POSTGRES_PORT=5432
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=your_secure_password
 POSTGRES_DB=nexus_ai
 
-# Or pass a full connection URL:
-# DATABASE_URL=postgresql+psycopg2://postgres:your_secure_password@localhost:5432/nexus_ai
-
 # Connection Pool Settings
 DB_POOL_SIZE=10
 DB_MAX_OVERFLOW=20
 DB_POOL_TIMEOUT=30
 DB_POOL_RECYCLE=1800
+
+# Authentication
+SECRET_KEY=your-secure-secret-key-min32chars
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+
+# Document Ingestion & Chunking (M3.1)
+STORAGE_DIR="./storage/documents"
+MAX_UPLOAD_SIZE_BYTES=20971520 # 20 MB
+CHUNK_SIZE_TOKENS=700
+CHUNK_OVERLAP_TOKENS=100
 ```
 
-> **Note**: For local development without a running PostgreSQL instance, `DATABASE_URL=sqlite:///./nexus_ai_dev.db` is supported out-of-the-box. Tests run automatically in an isolated in-memory SQLite database.
+---
 
-### Alembic Migrations
+## Database Migrations
 
 Run database migrations to initialize or update schema:
 
@@ -111,7 +128,7 @@ cd backend
 # Apply migrations to head
 .venv\Scripts\alembic upgrade head
 
-# Generate a new migration revision (if models change)
+# Generate a new migration revision
 .venv\Scripts\alembic revision --autogenerate -m "describe changes"
 ```
 
@@ -150,18 +167,22 @@ cd backend
 .venv\Scripts\pytest -v
 ```
 
-All 12 automated unit and integration tests execute against an isolated test database with rolled-back transactions per test.
+All 23 automated unit and integration tests execute against an isolated test database with table resets per test.
 
 ---
 
-## Authentication Flow
+## Document Processing & Ingestion Pipeline
 
-1. **User Registration**:
-   `POST /api/v1/auth/register` validates email syntax and password length (min 8 chars), verifies email uniqueness, and securely hashes passwords using **Argon2id**. Plaintext passwords are never persisted.
-2. **User Login**:
-   `POST /api/v1/auth/login` checks credentials via Argon2 verification and issues a signed **JWT Bearer Token** expiring according to `ACCESS_TOKEN_EXPIRE_MINUTES`.
-3. **Protected Endpoint**:
-   `GET /api/v1/auth/me` expects `Authorization: Bearer <token>`. The `get_current_user` dependency decodes the token, checks signature and expiration, and retrieves the active user from the database.
+1. **Validation & Streaming**:
+   `POST /api/v1/documents/upload` accepts `multipart/form-data`. The file is streamed in 64 KB chunks to verify magic bytes (`%PDF-`), ensure file size does not exceed `MAX_UPLOAD_SIZE_BYTES` (20 MB), and calculate the SHA-256 hash. Duplicate uploads for the same user are rejected with `409 Conflict`.
+2. **Storage Isolation**:
+   Files are stored in `STORAGE_DIR` using randomized UUID filenames (`<uuid>.pdf`), protecting against directory traversal and path exposure.
+3. **Extraction**:
+   `PDFProcessorService` uses PyMuPDF (`fitz`) to validate non-encryption, extract text page-by-page preserving 1-based page indices, reconnect hyphenated line wraps, and normalize whitespace. PDFs without extractable text or with encryption are flagged as `FAILED` with safe error explanations.
+4. **Chunking**:
+   `ChunkingService` segments text along sentence boundaries (`re.split`), sliding a window targeting ~700 tokens per chunk with ~100 tokens overlap, preserving page boundaries (`page_start`, `page_end`) and metadata (`character_count`, `sentence_count`).
+5. **Transactional Persistence**:
+   The `Document` and all associated `DocumentChunk` records are persisted in a single transaction. Deleting a document removes chunks via database cascade and unlinks the local file from disk.
 
 ---
 
@@ -173,3 +194,8 @@ All 12 automated unit and integration tests execute against an isolated test dat
 | `POST` | `/api/v1/auth/register` | Register new user | No | 201 Created, 409 Conflict, 422 Unprocessable |
 | `POST` | `/api/v1/auth/login` | Authenticate user & issue JWT | No | 200 OK, 401 Unauthorized, 403 Forbidden |
 | `GET` | `/api/v1/auth/me` | Fetch authenticated profile | Bearer JWT | 200 OK, 401 Unauthorized, 403 Forbidden |
+| `POST` | `/api/v1/documents/upload` | Upload & ingest PDF file | Bearer JWT | 201 Created, 400 Bad Request, 409 Conflict, 413 Too Large |
+| `GET` | `/api/v1/documents/` | List user documents (paginated) | Bearer JWT | 200 OK, 401 Unauthorized |
+| `GET` | `/api/v1/documents/{document_id}` | Get document metadata | Bearer JWT | 200 OK, 401 Unauthorized, 404 Not Found |
+| `GET` | `/api/v1/documents/{document_id}/chunks` | Get all document chunks | Bearer JWT | 200 OK, 401 Unauthorized, 404 Not Found |
+| `DELETE` | `/api/v1/documents/{document_id}` | Delete document, chunks & file | Bearer JWT | 204 No Content, 401 Unauthorized, 404 Not Found |

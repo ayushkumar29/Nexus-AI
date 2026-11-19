@@ -1,5 +1,7 @@
 """Pytest configuration and shared fixtures for Nexus AI backend tests."""
 
+import shutil
+import tempfile
 import pytest
 from typing import Generator
 from fastapi.testclient import TestClient
@@ -30,22 +32,37 @@ def setup_test_db() -> Generator[None, None, None]:
     Base.metadata.drop_all(bind=test_engine)
 
 
+@pytest.fixture(autouse=True)
+def clean_test_tables() -> Generator[None, None, None]:
+    """Ensure clean tables before every test."""
+    yield
+    # Clean up data between tests
+    with test_engine.connect() as conn:
+        for table in reversed(Base.metadata.sorted_tables):
+            conn.execute(table.delete())
+        conn.commit()
+
+
 @pytest.fixture
 def db_session() -> Generator[Session, None, None]:
-    """Provide a transactional database session per test, rolling back on teardown."""
-    connection = test_engine.connect()
-    transaction = connection.begin()
-    session = TestingSessionLocal(bind=connection)
-
-    yield session
-
-    session.close()
-    transaction.rollback()
-    connection.close()
+    """Provide a dedicated database session per test."""
+    session = TestingSessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
 
 
 @pytest.fixture
-def test_settings() -> Settings:
+def test_storage_dir() -> Generator[str, None, None]:
+    """Provide a temporary storage directory for file upload tests."""
+    temp_dir = tempfile.mkdtemp(prefix="nexus_test_storage_")
+    yield temp_dir
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def test_settings(test_storage_dir: str) -> Settings:
     """Fixture providing isolated test settings without production secrets."""
     return Settings(
         APP_NAME="Nexus AI Test",
@@ -57,6 +74,10 @@ def test_settings() -> Settings:
         ALGORITHM="HS256",
         ACCESS_TOKEN_EXPIRE_MINUTES=15,
         DATABASE_URL=TEST_DATABASE_URL,
+        STORAGE_DIR=test_storage_dir,
+        MAX_UPLOAD_SIZE_BYTES=2 * 1024 * 1024,  # 2MB in tests
+        CHUNK_SIZE_TOKENS=100,
+        CHUNK_OVERLAP_TOKENS=25,
     )
 
 

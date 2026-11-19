@@ -49,8 +49,8 @@ class DocumentChunkResponse(BaseModel):
     content: str = Field(..., description="Text content of the chunk")
     token_count: int = Field(..., description="Approximate token count")
     metadata: Dict[str, Any] = Field(
-        ...,
-        alias="metadata_",
+        default_factory=dict,
+        validation_alias="metadata_",
         description="Chunk metadata and references",
     )
 
